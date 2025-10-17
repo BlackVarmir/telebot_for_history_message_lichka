@@ -39,9 +39,5 @@ last_message_id.txt
 # Environment variables
 .env
 
-# Docker
-data/
-logs/
-
 # Ignore vscode AI rules
 .github\instructions\codacy.instructions.md

@@ -18,6 +18,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from typing import Dict, List, Any
 from openai import AsyncOpenAI
 from anthropic import AsyncAnthropic
+from dotenv import load_dotenv
+
+# Завантажуємо змінні з .env файлу
+load_dotenv()
 
 # Type alias для контексту (для сумісності з різними версіями IDE)
 ContextType = CallbackContext[Any, Any, Any, Any]
@@ -57,23 +61,23 @@ logging.getLogger("apscheduler").setLevel(logging.INFO)
 logging.getLogger("telegram").setLevel(logging.INFO)
 
 # Конфігурація Telegram Client API
-API_ID = "23266897"  # Отримайте на https://my.telegram.org
-API_HASH = "26ee63262a2274088768653a14fa6b35"  # Отримайте на https://my.telegram.org
+API_ID = os.getenv("API_ID")  # Отримайте на https://my.telegram.org
+API_HASH = os.getenv("API_HASH")  # Отримайте на https://my.telegram.org
 SESSION_NAME = "telegram_client"
 
 # Конфігурація Bot API
-BOT_TOKEN = "8160502358:AAG4c9N5PGLqmnEPE-HsdE3ctRhosW0dtg4"
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Отримайте у @BotFather
 
 # Конфігурація Storage Box
-STORAGE_BOX_HOST = "u475460.your-storagebox.de"
-STORAGE_BOX_USERNAME = "u475460"
-STORAGE_BOX_PASSWORD = "Mair558807."
-STORAGE_BOX_PATH = "/backup/telegram_bot/pomichnik_for_meassage_saved_bot/"
+STORAGE_BOX_HOST = os.getenv("STORAGE_BOX_HOST", )
+STORAGE_BOX_USERNAME = os.getenv("STORAGE_BOX_USERNAME")
+STORAGE_BOX_PASSWORD = os.getenv("STORAGE_BOX_PASSWORD")
+STORAGE_BOX_PATH = os.getenv("STORAGE_BOX_PATH")
 
 # Конфігурація AI (додайте свої ключі)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")  # Або вставте ключ тут
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "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")  # Або вставте ключ тут
-AI_PROVIDER = "openai"  # "openai" або "anthropic"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Або вставте ключ тут
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # Або вставте ключ тут
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")  # "openai" або "anthropic"
 
 # Ініціалізація AI клієнтів
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
