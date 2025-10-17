@@ -69,7 +69,7 @@ SESSION_NAME = "telegram_client"
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # Отримайте у @BotFather
 
 # Конфігурація Storage Box
-STORAGE_BOX_HOST = os.getenv("STORAGE_BOX_HOST", )
+STORAGE_BOX_HOST = os.getenv("STORAGE_BOX_HOST")
 STORAGE_BOX_USERNAME = os.getenv("STORAGE_BOX_USERNAME")
 STORAGE_BOX_PASSWORD = os.getenv("STORAGE_BOX_PASSWORD")
 STORAGE_BOX_PATH = os.getenv("STORAGE_BOX_PATH")
@@ -77,7 +77,7 @@ STORAGE_BOX_PATH = os.getenv("STORAGE_BOX_PATH")
 # Конфігурація AI (додайте свої ключі)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Або вставте ключ тут
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # Або вставте ключ тут
-AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")  # "openai" або "anthropic"
+AI_PROVIDER = os.getenv("AI_PROVIDER")  # "openai" або "anthropic"
 
 # Ініціалізація AI клієнтів
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
