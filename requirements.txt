@@ -1,0 +1,15 @@
+# Core dependencies
+pyrogram==2.0.106
+TgCrypto==1.2.5
+python-telegram-bot==21.5
+paramiko==3.4.0
+apscheduler==3.10.4
+
+# AI dependencies
+openai==1.51.2
+anthropic==0.34.2
+
+# Additional dependencies
+asyncio-mqtt==0.16.2
+aiofiles==24.1.0
+
