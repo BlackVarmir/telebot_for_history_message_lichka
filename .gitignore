@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+bot_*.log
+
+# Session files
+*.session
+*.session-journal
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# Data files
+saved_messages_*.json
+last_message_id.txt
+
+# Environment variables
+.env
+
+# Docker
+data/
+logs/
+
+# Ignore vscode AI rules
+.github\instructions\codacy.instructions.md
