@@ -2,13 +2,34 @@ import logging
 import sys
 import json
 import os
-import paramiko
 import uuid
 import signal
 import traceback
 import warnings
 import inspect
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# Налаштовуємо UTF-8 для консолі Windows з line buffering для негайного виводу
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+
+# КРИТИЧНО ВАЖЛИВО: Налаштовуємо warnings ДО будь-яких інших імпортів!
+# Придушуємо RuntimeWarning про незавершені корутини Pyrogram
+warnings.filterwarnings("ignore", message="coroutine.*was never awaited", category=RuntimeWarning)
+
+# Придушуємо CryptographyDeprecationWarning від paramiko (TripleDES)
+# Використовуємо найбільш агресивний підхід - блокуємо ВСІ DeprecationWarning
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Додатково блокуємо конкретне повідомлення про TripleDES
+warnings.filterwarnings("ignore", message=".*TripleDES.*")
+
+# Встановлюємо глобальний simplefilter для DeprecationWarning
+warnings.simplefilter("ignore", DeprecationWarning)
+
+# Тепер імпортуємо всі інші модулі
 from pyrogram import Client
 from pyrogram.types import Message
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Message as TelegramMessage
@@ -19,16 +40,16 @@ from typing import Dict, List, Any
 from openai import AsyncOpenAI
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+import paramiko  # Імпортуємо ПІСЛЯ налаштування фільтрів
+import gzip  # OPTIMIZATION: Moved from functions to top
+import shutil  # OPTIMIZATION: Moved from functions to top
+import glob  # OPTIMIZATION: Moved from functions to top
 
 # Завантажуємо змінні з .env файлу
 load_dotenv()
 
-# Type alias для контексту (для сумісності з різними версіями IDE)
+# Type alias для контексту (для сумісності з різними версіми IDE)
 ContextType = CallbackContext[Any, Any, Any, Any]
-
-# Придушуємо RuntimeWarning про незавершені корутини Pyrogram
-# Це відома проблема Pyrogram - Dispatcher створює tasks які не очищаються
-warnings.filterwarnings("ignore", message="coroutine.*was never awaited", category=RuntimeWarning)
 
 # Функція для отримання імені файлу логів з датою
 def get_log_filename():
@@ -60,6 +81,17 @@ logging.getLogger("paramiko").setLevel(logging.INFO)
 logging.getLogger("apscheduler").setLevel(logging.INFO)
 logging.getLogger("telegram").setLevel(logging.INFO)
 
+# Фільтруємо asyncio "Task was destroyed" помилки в консолі (але залишаємо в файлі)
+class AsyncioTaskFilter(logging.Filter):
+    def filter(self, record):
+        # Блокуємо тільки "Task was destroyed" помилки в stderr
+        if "Task was destroyed but it is pending" in record.getMessage():
+            return False
+        return True
+
+# Додаємо фільтр до console handler
+console_handler.addFilter(AsyncioTaskFilter())
+
 # Конфігурація Telegram Client API
 API_ID = os.getenv("API_ID")  # Отримайте на https://my.telegram.org
 API_HASH = os.getenv("API_HASH")  # Отримайте на https://my.telegram.org
@@ -83,6 +115,10 @@ AI_PROVIDER = os.getenv("AI_PROVIDER")  # "openai" або "anthropic"
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 AI_ENABLED = bool(openai_client or anthropic_client)
+
+# Глобальні менеджери сховища та медіа (ініціалізуються при старті)
+storage_manager = None
+media_manager = None
 
 # Імпорт модулів самооптимізації (після ініціалізації logger)
 OPTIMIZATION_ENABLED = False
@@ -166,11 +202,22 @@ settings = {
 # Глобальна змінна для поточної дати
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 
-
+# OPTIMIZATION: Magic number constants for better maintainability
+PAGINATION_ITEMS_PER_PAGE = 10  # Items per page in file/history listings
+MESSAGES_PER_PAGE = 5           # Messages per page when viewing
+LARGE_FILE_THRESHOLD_MB = 50    # Compress files larger than this (MB)
+MAX_TEXT_PREVIEW_LENGTH = 50    # Max characters for message preview
+S3_MULTIPART_THRESHOLD_MB = 100 # S3 multipart upload threshold (MB)
 
 # Функція для очищення старих локальних файлів
 def cleanup_old_local_files():
-    """Видаляє старі локальні файли з повідомленнями (не поточного дня)"""
+    """Видаляє старі локальні файли з повідомленнями (не поточного дня), попередньо завантаживши їх на S3"""
+    global storage_manager
+
+    if not storage_manager:
+        logger.warning("⚠️ StorageManager не ініціалізовано, пропускаю очищення файлів")
+        return
+
     try:
         current_date = datetime.now().strftime("%Y-%m-%d")
         current_file = f"saved_messages_{current_date}.json"
@@ -178,16 +225,44 @@ def cleanup_old_local_files():
         # Знаходимо всі файли з повідомленнями
         message_files = [f for f in os.listdir('.') if f.startswith('saved_messages_') and f.endswith('.json')]
 
+        # Отримуємо список файлів на S3
+        try:
+            remote_files = storage_manager.storage.list_files()
+            remote_message_names = [f.split('/')[-1] for f in remote_files if 'saved_messages_' in f]
+        except Exception as e:
+            logger.warning(f"⚠️ Не вдалося отримати список файлів з S3: {e}")
+            remote_message_names = []
+
         deleted_count = 0
+        uploaded_count = 0
         for file in message_files:
             if file != current_file:
                 try:
+                    # Перевіряємо чи файл вже є на S3
+                    is_on_s3 = file in remote_message_names
+
+                    # Якщо файлу немає на S3, завантажуємо його
+                    if not is_on_s3:
+                        logger.info(f"📤 Завантажую старі повідомлення на S3: {file}")
+                        local_path = os.path.abspath(file)
+
+                        # Завантажуємо
+                        if storage_manager.upload_file(local_path, file):
+                            uploaded_count += 1
+                            logger.info(f"✅ Повідомлення завантажено на S3: {file}")
+                        else:
+                            logger.warning(f"⚠️ Не вдалося завантажити {file}, пропускаю видалення")
+                            continue
+
+                    # Тепер видаляємо локальний файл
                     os.remove(file)
                     logger.info(f"🗑️ Видалено старий локальний файл: {file}")
                     deleted_count += 1
                 except Exception as file_exc:
-                    logger.error(f"❌ Помилка видалення файлу {file}: {file_exc}")
+                    logger.error(f"❌ Помилка обробки файлу {file}: {file_exc}")
 
+        if uploaded_count > 0:
+            logger.info(f"📤 Завантажено на S3: {uploaded_count} файлів з повідомленнями")
         if deleted_count > 0:
             logger.info(f"✅ Очищено {deleted_count} старих локальних файлів")
         else:
@@ -199,6 +274,29 @@ def cleanup_old_local_files():
 # Глобальні змінні
 user_viewing_state: Dict[str, Dict[str, Any]] = {}  # Ключ - str (user_id_filename)
 files_cache: Dict[str, List[str]] = {}  # Ключ - str (user_id)
+
+# OPTIMIZATION: In-memory cache for message IDs to prevent excessive file I/O
+# This set is updated when messages are saved and reduces disk reads from hundreds to zero per minute
+message_ids_cache: set = set()
+cache_initialized: bool = False
+
+def initialize_message_cache():
+    """OPTIMIZATION: Initialize message ID cache from disk (called once at startup)"""
+    global message_ids_cache, cache_initialized
+
+    if cache_initialized:
+        return
+
+    try:
+        data = load_messages()
+        if data and isinstance(data, dict) and 'messages' in data:
+            message_ids_cache = set(msg['message_id'] for msg in data.get('messages', []))
+            logger.info(f"📦 Кеш ініціалізовано: {len(message_ids_cache)} повідомлень")
+        cache_initialized = True
+    except Exception as e:
+        logger.warning(f"⚠️ Помилка ініціалізації кешу: {e}")
+        message_ids_cache = set()
+        cache_initialized = True
 
 # Функція для перевірки доступу до бота
 def check_access(user_id):
@@ -299,6 +397,608 @@ class StorageBoxManager:
             
     def close(self):
         self.ssh.close()
+
+# Object Storage Manager для S3-compatible storage (Hetzner)
+class ObjectStorageManager:
+    """Менеджер для роботи з S3-compatible Object Storage"""
+
+    def __init__(self):
+        try:
+            import boto3
+            from botocore.exceptions import ClientError
+            self.boto3 = boto3
+            self.ClientError = ClientError
+
+            # Читаємо конфігурацію з .env
+            self.endpoint_url = os.getenv("S3_ENDPOINT_URL")
+            self.access_key = os.getenv("S3_ACCESS_KEY")
+            self.secret_key = os.getenv("S3_SECRET_KEY")
+            self.bucket_name = os.getenv("S3_BUCKET_NAME", "telegram-bot-backup")
+            self.region = os.getenv("S3_REGION", "fsn1")
+            self.prefix = os.getenv("S3_PREFIX", "").strip()  # Папка в bucket (опціонально)
+
+            # Переконуємося що prefix закінчується на / якщо він не порожній
+            if self.prefix and not self.prefix.endswith('/'):
+                self.prefix += '/'
+
+            # Створюємо S3 клієнт
+            self.s3_client = self.boto3.client(
+                's3',
+                endpoint_url=self.endpoint_url,
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                region_name=self.region
+            )
+
+            # Перевіряємо/створюємо bucket
+            self._ensure_bucket_exists()
+
+            if self.prefix:
+                logger.info(f"✅ Object Storage ініціалізовано (bucket: {self.bucket_name}, folder: {self.prefix})")
+            else:
+                logger.info(f"✅ Object Storage ініціалізовано (bucket: {self.bucket_name}, root)")
+
+
+        except ImportError:
+            logger.error("❌ boto3 не встановлено. Встановіть: pip install boto3")
+            raise
+        except Exception as e:
+            logger.error(f"❌ Помилка ініціалізації Object Storage: {e}")
+            raise
+
+    def _ensure_bucket_exists(self):
+        """Перевіряє чи існує bucket, якщо ні - створює"""
+        try:
+            self.s3_client.head_bucket(Bucket=self.bucket_name)
+            logger.debug(f"✅ Bucket '{self.bucket_name}' існує")
+        except self.ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == '404':
+                try:
+                    self.s3_client.create_bucket(Bucket=self.bucket_name)
+                    logger.info(f"✅ Створено bucket '{self.bucket_name}'")
+                except Exception as create_error:
+                    logger.error(f"❌ Помилка створення bucket: {create_error}")
+                    raise
+            else:
+                logger.error(f"❌ Помилка перевірки bucket: {e}")
+                raise
+
+    def upload_file(self, local_path, remote_key):
+        """Завантажує файл на Object Storage з підтримкою multipart для великих файлів"""
+        try:
+            # Перевіряємо чи існує файл
+            if not os.path.exists(local_path):
+                print(f"❌ Файл не існує: {local_path}")
+                logger.error(f"❌ Файл не існує: {local_path}")
+                return False
+
+            # Перевіряємо чи файл вже існує на S3
+            full_key = self.prefix + remote_key
+            file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
+
+            try:
+                # Перевіряємо чи існує файл з таким же розміром
+                existing_obj = self.s3_client.head_object(Bucket=self.bucket_name, Key=full_key)
+                existing_size_mb = existing_obj['ContentLength'] / (1024 * 1024)
+
+                if abs(existing_size_mb - file_size_mb) < 0.1:  # Різниця < 100KB
+                    print(f"⏭️  Файл вже існує на S3 з тим же розміром ({file_size_mb:.2f} MB), пропускаю")
+                    logger.info(f"⏭️  Файл {remote_key} вже існує на S3, пропускаю")
+                    return True  # Повертаємо True бо файл вже там є
+            except self.ClientError:
+                # Файл не існує - це нормально, продовжуємо
+                pass
+
+            print(f"🔧 S3 Upload:")
+            print(f"   Bucket: {self.bucket_name}")
+            print(f"   Full key: {full_key}")
+            print(f"   Size: {file_size_mb:.2f} MB")
+
+            # Визначаємо content type
+            content_type = 'application/octet-stream'
+            if remote_key.endswith('.json'):
+                content_type = 'application/json'
+            elif remote_key.endswith('.log'):
+                content_type = 'text/plain'
+            elif remote_key.endswith('.log.gz') or remote_key.endswith('.gz'):
+                content_type = 'application/gzip'
+            elif remote_key.endswith('.jpg') or remote_key.endswith('.jpeg'):
+                content_type = 'image/jpeg'
+            elif remote_key.endswith('.png'):
+                content_type = 'image/png'
+            elif remote_key.endswith('.mp4'):
+                content_type = 'video/mp4'
+
+            # Використовуємо multipart upload для файлів > 100MB
+            from boto3.s3.transfer import TransferConfig
+
+            # Конфігурація для multipart upload
+            config = TransferConfig(
+                multipart_threshold=100 * 1024 * 1024,  # 100 MB
+                max_concurrency=10,
+                multipart_chunksize=25 * 1024 * 1024,  # 25 MB chunks
+                use_threads=True
+            )
+
+            print(f"📤 Завантажую {'(multipart)' if file_size_mb > 100 else ''}...")
+
+            self.s3_client.upload_file(
+                local_path,
+                self.bucket_name,
+                full_key,
+                ExtraArgs={'ContentType': content_type},
+                Config=config
+            )
+
+            print(f"✅ Файл завантажено успішно!")
+            logger.info(f"✅ Файл {local_path} ({file_size_mb:.2f} MB) завантажено як {full_key}")
+            return True
+        except Exception as e:
+            print(f"❌ Помилка завантаження файлу: {e}")
+            logger.error(f"❌ Помилка завантаження файлу: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def list_files(self, prefix=''):
+        """Повертає список файлів з вказаним префіксом"""
+        try:
+            # Комбінуємо self.prefix з переданим prefix
+            full_prefix = self.prefix + prefix
+
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket_name,
+                Prefix=full_prefix
+            )
+
+            if 'Contents' not in response:
+                return []
+
+            files = [obj['Key'] for obj in response['Contents']]
+
+            # Видаляємо self.prefix з результатів для зворотної сумісності
+            if self.prefix:
+                files = [f[len(self.prefix):] if f.startswith(self.prefix) else f for f in files]
+
+            # Фільтруємо тільки файли з повідомленнями якщо префікс не вказано
+            if not prefix:
+                files = [f for f in files if 'saved_messages_' in f and f.endswith('.json')]
+
+            logger.info(f"📁 Знайдено файлів: {len(files)}")
+            return sorted(files, reverse=True)
+        except Exception as e:
+            logger.error(f"❌ Помилка отримання списку файлів: {e}")
+            return []
+
+    def download_file(self, remote_key):
+        """Завантажує файл з Object Storage"""
+        try:
+            # Додаємо prefix до remote_key
+            full_key = self.prefix + remote_key
+
+            # Створюємо тимчасову директорію
+            if not os.path.exists("temp"):
+                os.makedirs("temp")
+
+            local_path = os.path.join("temp", os.path.basename(remote_key))
+            self.s3_client.download_file(self.bucket_name, full_key, local_path)
+            logger.info(f"✅ Файл {remote_key} завантажено")
+            return local_path
+        except Exception as e:
+            logger.error(f"❌ Помилка завантаження файлу {remote_key}: {e}")
+            return None
+
+    def delete_file(self, remote_key):
+        """Видаляє файл з Object Storage"""
+        try:
+            self.s3_client.delete_object(Bucket=self.bucket_name, Key=remote_key)
+            logger.info(f"🗑️ Файл {remote_key} видалено")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Помилка видалення файлу {remote_key}: {e}")
+            return False
+
+# Уніфікований Storage Manager
+class StorageManager:
+    """Універсальний менеджер сховища - підтримує SFTP та S3"""
+
+    def __init__(self):
+        storage_type = os.getenv("STORAGE_TYPE", "sftp").lower()
+
+        if storage_type == "s3":
+            logger.info("🔧 Використовується Object Storage (S3)")
+            self.storage = ObjectStorageManager()
+            self.storage_type = "s3"
+        else:
+            logger.info("🔧 Використовується SFTP Storage Box")
+            self.storage = StorageBoxManager()
+            self.storage_type = "sftp"
+
+    def connect(self):
+        """Підключення (тільки для SFTP)"""
+        if self.storage_type == "sftp":
+            return self.storage.connect()
+        return True  # S3 не потребує підключення
+
+    def upload_file(self, local_path, remote_filename):
+        """Завантажує файл"""
+        return self.storage.upload_file(local_path, remote_filename)
+
+    def list_files(self):
+        """Повертає список файлів"""
+        return self.storage.list_files()
+
+    def download_file(self, remote_filename):
+        """Завантажує файл"""
+        return self.storage.download_file(remote_filename)
+
+    def close(self):
+        """Закриває з'єднання (тільки для SFTP)"""
+        if self.storage_type == "sftp":
+            self.storage.close()
+
+# Менеджер медіа файлів
+class MediaManager:
+    """Менеджер для збереження медіа файлів"""
+
+    def __init__(self, storage_manager: StorageManager):
+        self.storage = storage_manager
+        self.media_dir = "media"
+
+        # Створюємо локальні папки для медіа
+        self.media_types = {
+            'photo': 'photos',
+            'video': 'videos',
+            'document': 'documents',
+            'audio': 'audio',
+            'voice': 'voice',
+            'sticker': 'stickers',
+            'animation': 'animations'
+        }
+
+        for folder in self.media_types.values():
+            path = os.path.join(self.media_dir, folder)
+            os.makedirs(path, exist_ok=True)
+
+        logger.info("📁 MediaManager ініціалізовано")
+
+    async def save_media(self, message: Message, message_data: dict) -> dict:
+        """Зберігає медіа з повідомлення та оновлює message_data"""
+        try:
+            media_info = {}
+
+            # Визначаємо тип медіа
+            if message.photo:
+                media_info = await self._save_photo(message)
+            elif message.video:
+                media_info = await self._save_video(message)
+            elif message.document:
+                media_info = await self._save_document(message)
+            elif message.audio:
+                media_info = await self._save_audio(message)
+            elif message.voice:
+                media_info = await self._save_voice(message)
+            elif message.sticker:
+                media_info = await self._save_sticker(message)
+            elif message.animation:
+                media_info = await self._save_animation(message)
+
+            # Додаємо інформацію про медіа в message_data
+            if media_info:
+                message_data['media'] = media_info
+                logger.info(f"💾 Медіа збережено: {media_info['type']} -> {media_info.get('local_path', 'N/A')}")
+
+            return message_data
+
+        except Exception as e:
+            logger.error(f"❌ Помилка збереження медіа (msg {message.id}): {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return message_data
+
+    async def _save_photo(self, message: Message) -> dict:
+        """Зберігає фото локально (без відправки на S3)"""
+        photo = message.photo  # Об'єкт Photo
+
+        # Беремо найбільший розмір фото з thumbs
+        largest_thumb = None
+        if photo and hasattr(photo, 'thumbs') and photo.thumbs:
+            largest_thumb = max(photo.thumbs, key=lambda x: getattr(x, 'file_size', 0))
+            file_unique_id = largest_thumb.file_unique_id
+        elif photo:
+            file_unique_id = photo.file_unique_id
+        else:
+            raise ValueError("Photo object is None")
+
+        file_name = f"photo_{message.id}_{file_unique_id}.jpg"
+        local_path = os.path.join(self.media_dir, 'photos', file_name)
+
+        # Завантажуємо фото локально
+        await message.download(local_path)
+
+        return {
+            'type': 'photo',
+            'filename': file_name,
+            'file_id': photo.file_id,
+            'file_unique_id': photo.file_unique_id,
+            'file_size': getattr(largest_thumb, 'file_size', None) if largest_thumb else None,
+            'local_path': local_path
+        }
+
+    async def _save_video(self, message: Message) -> dict:
+        """Зберігає відео локально (без відправки на S3)"""
+        video = message.video
+        if not video:
+            raise ValueError("Video object is None")
+
+        file_name = f"video_{message.id}_{video.file_unique_id}.mp4"
+        local_path = os.path.join(self.media_dir, 'videos', file_name)
+
+        await message.download(local_path)
+
+        return {
+            'type': 'video',
+            'filename': file_name,
+            'file_id': video.file_id,
+            'file_unique_id': video.file_unique_id,
+            'file_size': getattr(video, 'file_size', None),
+            'duration': getattr(video, 'duration', None),
+            'width': getattr(video, 'width', None),
+            'height': getattr(video, 'height', None),
+            'mime_type': getattr(video, 'mime_type', None),
+            'local_path': local_path
+        }
+
+    async def _save_document(self, message: Message) -> dict:
+        """Зберігає документ локально (без відправки на S3)"""
+        document = message.document
+        if not document:
+            raise ValueError("Document object is None")
+
+        file_name = f"doc_{message.id}_{document.file_unique_id}_{document.file_name}"
+        local_path = os.path.join(self.media_dir, 'documents', file_name)
+
+        await message.download(local_path)
+
+        return {
+            'type': 'document',
+            'filename': file_name,
+            'file_id': document.file_id,
+            'file_unique_id': document.file_unique_id,
+            'file_size': getattr(document, 'file_size', None),
+            'file_name': getattr(document, 'file_name', 'unknown'),
+            'mime_type': getattr(document, 'mime_type', None),
+            'local_path': local_path
+        }
+
+    async def _save_audio(self, message: Message) -> dict:
+        """Зберігає аудіо локально (без відправки на S3)"""
+        audio = message.audio
+        if not audio:
+            raise ValueError("Audio object is None")
+
+        file_name = f"audio_{message.id}_{audio.file_unique_id}.mp3"
+        local_path = os.path.join(self.media_dir, 'audio', file_name)
+
+        await message.download(local_path)
+
+        return {
+            'type': 'audio',
+            'filename': file_name,
+            'file_id': audio.file_id,
+            'file_unique_id': audio.file_unique_id,
+            'file_size': getattr(audio, 'file_size', None),
+            'duration': getattr(audio, 'duration', None),
+            'performer': getattr(audio, 'performer', None),
+            'title': getattr(audio, 'title', None),
+            'mime_type': getattr(audio, 'mime_type', None),
+            'local_path': local_path
+        }
+
+    async def _save_voice(self, message: Message) -> dict:
+        """Зберігає голосове повідомлення локально (без відправки на S3)"""
+        voice = message.voice
+        if not voice:
+            raise ValueError("Voice object is None")
+
+        file_name = f"voice_{message.id}_{voice.file_unique_id}.ogg"
+        local_path = os.path.join(self.media_dir, 'voice', file_name)
+
+        await message.download(local_path)
+
+        return {
+            'type': 'voice',
+            'filename': file_name,
+            'file_id': voice.file_id,
+            'file_unique_id': voice.file_unique_id,
+            'file_size': getattr(voice, 'file_size', None),
+            'duration': getattr(voice, 'duration', None),
+            'mime_type': getattr(voice, 'mime_type', None),
+            'local_path': local_path
+        }
+
+    async def _save_sticker(self, message: Message) -> dict:
+        """Зберігає стікер локально (без відправки на S3)"""
+        sticker = message.sticker
+        if not sticker:
+            raise ValueError("Sticker object is None")
+
+        file_ext = 'webp' if getattr(sticker, 'is_animated', False) else 'webp'
+        file_name = f"sticker_{message.id}_{sticker.file_unique_id}.{file_ext}"
+        local_path = os.path.join(self.media_dir, 'stickers', file_name)
+
+        await message.download(local_path)
+
+        return {
+            'type': 'sticker',
+            'filename': file_name,
+            'file_id': sticker.file_id,
+            'file_unique_id': sticker.file_unique_id,
+            'file_size': getattr(sticker, 'file_size', None),
+            'width': getattr(sticker, 'width', None),
+            'height': getattr(sticker, 'height', None),
+            'is_animated': getattr(sticker, 'is_animated', False),
+            'emoji': getattr(sticker, 'emoji', None),
+            'set_name': getattr(sticker, 'set_name', None),
+            'local_path': local_path
+        }
+
+    async def _save_animation(self, message: Message) -> dict:
+        """Зберігає GIF анімацію локально (без відправки на S3)"""
+        animation = message.animation
+        if not animation:
+            raise ValueError("Animation object is None")
+
+        file_name = f"animation_{message.id}_{animation.file_unique_id}.mp4"
+        local_path = os.path.join(self.media_dir, 'animations', file_name)
+
+        await message.download(local_path)
+
+        return {
+            'type': 'animation',
+            'filename': file_name,
+            'file_id': animation.file_id,
+            'file_unique_id': animation.file_unique_id,
+            'file_size': getattr(animation, 'file_size', None),
+            'duration': getattr(animation, 'duration', None),
+            'width': getattr(animation, 'width', None),
+            'height': getattr(animation, 'height', None),
+            'mime_type': getattr(animation, 'mime_type', None),
+            'local_path': local_path
+        }
+
+    def upload_media_to_storage(self) -> dict:
+        """
+        Завантажує всі медіа файли на S3 з організацією по датах та типах чатів.
+        Структура: {prefix}{date}/{chat_type}/photos/filename
+        Повертає статистику завантаження.
+        """
+        from datetime import datetime
+        import glob
+
+        stats = {
+            'uploaded': 0,
+            'failed': 0,
+            'deleted_local': 0,
+            'errors': []
+        }
+
+        try:
+            # Завантажуємо збережені повідомлення щоб дізнатись про чат і дату
+            data = load_messages()
+            messages_by_file = {}  # local_path -> (chat_type, date)
+
+            for msg in data['messages']:
+                if 'media' in msg and 'local_path' in msg['media']:
+                    local_path = msg['media']['local_path']
+                    chat_type = msg.get('chat_type', 'UNKNOWN')
+                    # Парсимо дату з ISO формату
+                    msg_date = datetime.fromisoformat(msg['date']).date()
+                    messages_by_file[local_path] = (chat_type, msg_date.isoformat())
+
+            logger.info(f"📤 Починаємо завантаження медіа: {len(messages_by_file)} файлів")
+
+            # Обробляємо кожен тип медіа
+            for media_type, folder_name in self.media_types.items():
+                folder_path = os.path.join(self.media_dir, folder_name)
+
+                if not os.path.exists(folder_path):
+                    continue
+
+                # Знаходимо всі файли в папці
+                files = glob.glob(os.path.join(folder_path, '*'))
+
+                for local_path in files:
+                    if not os.path.isfile(local_path):
+                        continue
+
+                    file_name = os.path.basename(local_path)
+
+                    # Визначаємо чат і дату з повідомлень
+                    if local_path in messages_by_file:
+                        chat_type, date_str = messages_by_file[local_path]
+                    else:
+                        # Якщо не знайдено в повідомленнях, використовуємо сьогоднішню дату
+                        chat_type = "UNKNOWN"
+                        date_str = datetime.now().date().isoformat()
+
+                    # Формуємо remote_key з організацією по датах і типах
+                    # Формат: {date}/{chat_type}/photos/filename
+                    remote_key = f"{date_str}/{chat_type}/{folder_name}/{file_name}"
+
+                    try:
+                        # Завантажуємо на S3
+                        if self.storage.upload_file(local_path, remote_key):
+                            stats['uploaded'] += 1
+                            logger.info(f"✅ Завантажено: {remote_key}")
+
+                            # Видаляємо локальний файл після успішного завантаження
+                            try:
+                                os.remove(local_path)
+                                stats['deleted_local'] += 1
+                                logger.debug(f"🗑️ Видалено локально: {local_path}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Не вдалося видалити {local_path}: {e}")
+                        else:
+                            stats['failed'] += 1
+                            stats['errors'].append(f"Upload failed: {file_name}")
+
+                    except Exception as e:
+                        stats['failed'] += 1
+                        error_msg = f"Error uploading {file_name}: {e}"
+                        stats['errors'].append(error_msg)
+                        logger.error(f"❌ {error_msg}")
+
+            logger.info(f"📊 Завантаження медіа завершено: ✅ {stats['uploaded']}, ❌ {stats['failed']}, 🗑️ {stats['deleted_local']}")
+
+        except Exception as e:
+            logger.error(f"❌ Критична помилка при завантаженні медіа: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            stats['errors'].append(f"Critical error: {e}")
+
+        return stats
+
+# Функція ініціалізації менеджерів
+def initialize_managers():
+    """Ініціалізує менеджери сховища та медіа"""
+    global storage_manager, media_manager
+
+    try:
+        logger.info("🔧 Ініціалізація менеджерів сховища та медіа...")
+
+        # Виводимо налаштування .env для діагностики
+        storage_type_env = os.getenv("STORAGE_TYPE", "не встановлено")
+        logger.info(f"📋 STORAGE_TYPE з .env: {storage_type_env}")
+
+        # Створюємо Storage Manager (підтримує SFTP та S3)
+        storage_manager = StorageManager()
+        logger.info(f"✅ StorageManager ініціалізовано (тип: {storage_manager.storage_type})")
+
+        # Перевіряємо підключення (для SFTP)
+        if storage_manager.storage_type == "sftp":
+            if not storage_manager.connect():
+                logger.warning("⚠️ Не вдалося підключитися до SFTP Storage Box")
+                logger.info("💡 Спробуйте перевірити налаштування в .env файлі")
+            else:
+                logger.info("✅ SFTP підключення встановлено")
+                storage_manager.close()  # Закриваємо тестове з'єднання
+        else:
+            logger.info("✅ S3 Object Storage готовий до використання")
+
+        # Створюємо Media Manager
+        media_manager = MediaManager(storage_manager)
+        logger.info("✅ MediaManager ініціалізовано")
+
+        logger.info("🎉 Всі менеджери успішно ініціалізовано!")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Помилка ініціалізації менеджерів: {e}")
+        logger.error(f"📋 Трейсбек: {traceback.format_exc()}")
+        logger.warning("⚠️ Бот працюватиме без Object Storage та збереження медіа")
+        return False
 
 # AI Асистент для аналізу помилок
 class AIAssistant:
@@ -609,6 +1309,8 @@ def load_messages():
     return {"messages": []}
 
 def save_message(message_data):
+    global message_ids_cache
+
     data = load_messages()
     data["messages"].append(message_data)
 
@@ -616,10 +1318,13 @@ def save_message(message_data):
     with open(data_file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+    # OPTIMIZATION: Update in-memory cache to avoid re-reading file
+    message_ids_cache.add(message_data['message_id'])
+
     # Компактний вивід в консоль
     chat_name = message_data.get('chat_title', 'Збережені')
     msg_time = datetime.fromisoformat(message_data['date']).strftime('%H:%M:%S')
-    msg_text = message_data.get('text', '[медіа]')[:50]  # Перші 50 символів
+    msg_text = message_data.get('text', '[медіа]')[:MAX_TEXT_PREVIEW_LENGTH]  # Попередній перегляд
 
     print(f"💾 {chat_name} | {msg_time} | {msg_text}")
 
@@ -627,6 +1332,7 @@ def save_message(message_data):
 
 # Функція для відправки файлу на Storage Box
 async def upload_to_storage_box():
+    """Відправляє файли на сховище (SFTP або S3)"""
     # Отримуємо файл поточного дня
     data_file = get_current_data_file()
 
@@ -638,65 +1344,179 @@ async def upload_to_storage_box():
     file_date = datetime.now().strftime("%Y-%m-%d")
     remote_filename = f"saved_messages_{file_date}.json"
 
-    # Завантажуємо файл на Storage Box
-    storage_box = StorageBoxManager()
-    if storage_box.connect():
-        success = storage_box.upload_file(data_file, remote_filename)
-        storage_box.close()
+    # Використовуємо новий StorageManager
+    if storage_manager:
+        try:
+            if storage_manager.connect():
+                success = storage_manager.upload_file(data_file, remote_filename)
+                storage_manager.close()
 
-        if success:
-            logger.info(f"✅ Файл {data_file} успішно відправлено на сервер")
-            logger.info(f"📁 Локальний файл збережено до автоматичного очищення о 01:00")
-        else:
-            logger.error("Не вдалося завантажити файл на Storage Box - локальний файл збережено")
+                if success:
+                    logger.info(f"✅ Файл {data_file} успішно відправлено на сховище ({storage_manager.storage_type})")
+                    logger.info(f"📁 Локальний файл збережено до автоматичного очищення о 01:00")
+                else:
+                    logger.error("Не вдалося завантажити файл на сховище - локальний файл збережено")
+            else:
+                logger.error("Не вдалося підключитися до сховища - локальний файл збережено")
+        except Exception as e:
+            logger.error(f"❌ Помилка завантаження на сховище: {e}")
+            logger.info("📁 Локальний файл збережено")
     else:
-        logger.error("Не вдалося підключитися до Storage Box - локальний файл збережено")
+        logger.error("StorageManager не ініціалізовано - локальний файл збережено")
 
 # Функція для відправки логів на Storage Box
 async def upload_logs_to_storage_box():
-    """Відправляє старі лог-файли на Storage Box"""
+    """Відправляє старі лог-файли на сховище (SFTP або S3)"""
     try:
         # Знаходимо всі лог-файли
         log_files = [f for f in os.listdir('.') if f.startswith('bot_') and f.endswith('.log')]
 
+        print(f"🔍 Знайдено лог-файлів: {len(log_files)}")
+        logger.info(f"🔍 Знайдено лог-файлів: {len(log_files)}")
+
         if not log_files:
+            print("Немає лог-файлів для відправки")
             logger.info("Немає лог-файлів для відправки")
             return
 
-        storage_box = StorageBoxManager()
-        if not storage_box.connect():
-            logger.error("Не вдалося підключитися до Storage Box для відправки логів")
+        if not storage_manager:
+            print("❌ StorageManager не ініціалізовано")
+            logger.error("StorageManager не ініціалізовано")
             return
+
+        print(f"✅ Storage type: {storage_manager.storage_type}")
+        logger.info(f"✅ Storage type: {storage_manager.storage_type}")
+
+        if not storage_manager.connect():
+            print("❌ Не вдалося підключитися до сховища")
+            logger.error("Не вдалося підключитися до сховища для відправки логів")
+            return
+
+        print("✅ Підключення до сховища успішне")
+
+        current_log = get_log_filename()
+        print(f"📝 Поточний лог (НЕ буде відправлено): {current_log}")
 
         uploaded_count = 0
         for log_file in log_files:
             # Не відправляємо поточний лог-файл
-            if log_file == get_log_filename():
+            if log_file == current_log:
+                print(f"⏭️  Пропускаю поточний лог: {log_file}")
                 continue
 
-            # Відправляємо на сервер
-            remote_filename = f"logs/{log_file}"
-            if storage_box.upload_file(log_file, remote_filename):
-                uploaded_count += 1
-                logger.info(f"✅ Лог {log_file} відправлено на сервер")
+            # Повний шлях до локального файлу
+            local_path = os.path.abspath(log_file)
+            file_size_mb = os.path.getsize(local_path) / (1024 * 1024)  # MB
+
+            # Стискаємо лог-файл якщо він більший за поріг
+            if file_size_mb > LARGE_FILE_THRESHOLD_MB:
+                gz_path = local_path + '.gz'
+                print(f"📦 Стискаю великий файл: {log_file} ({file_size_mb:.2f} MB)")
+
+                try:
+                    with open(local_path, 'rb') as f_in:
+                        with gzip.open(gz_path, 'wb', compresslevel=9) as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+
+                    gz_size_mb = os.path.getsize(gz_path) / (1024 * 1024)
+                    compression_ratio = (1 - gz_size_mb / file_size_mb) * 100
+
+                    print(f"   Стиснуто: {file_size_mb:.2f} MB → {gz_size_mb:.2f} MB (-{compression_ratio:.1f}%)")
+
+                    # Використовуємо стиснутий файл
+                    upload_path = gz_path
+                    remote_filename = f"logs/{log_file}.gz"
+                    file_to_delete = gz_path  # Видалимо тимчасовий gz файл після upload
+
+                except Exception as e:
+                    print(f"❌ Помилка стискання: {e}, відправляю оригінал")
+                    upload_path = local_path
+                    remote_filename = f"logs/{log_file}"
+                    file_to_delete = None
             else:
+                upload_path = local_path
+                remote_filename = f"logs/{log_file}"
+                file_to_delete = None
+
+            # Відправляємо на сервер
+            upload_size_mb = os.path.getsize(upload_path) / (1024 * 1024)
+            print(f"📤 Відправляю: {os.path.basename(upload_path)} ({upload_size_mb:.2f} MB)")
+            print(f"   Local: {upload_path}")
+            print(f"   Remote: {remote_filename}")
+
+            if storage_manager.upload_file(upload_path, remote_filename):
+                uploaded_count += 1
+                print(f"✅ Лог {log_file} відправлено на сховище")
+                logger.info(f"✅ Лог {log_file} відправлено на сховище")
+
+                # Видаляємо тимчасовий gz файл якщо був створений
+                if file_to_delete and os.path.exists(file_to_delete):
+                    os.remove(file_to_delete)
+            else:
+                print(f"❌ Помилка відправки логу {log_file}")
                 logger.error(f"❌ Помилка відправки логу {log_file}")
 
-        storage_box.close()
-        logger.info(f"📤 Відправлено {uploaded_count} лог-файлів на Storage Box")
+                # Все одно видаляємо тимчасовий файл
+                if file_to_delete and os.path.exists(file_to_delete):
+                    os.remove(file_to_delete)
+
+        storage_manager.close()
+        print(f"📤 Відправлено {uploaded_count} лог-файлів на сховище ({storage_manager.storage_type})")
+        logger.info(f"📤 Відправлено {uploaded_count} лог-файлів на сховище ({storage_manager.storage_type})")
 
     except Exception as e:
+        print(f"❌ Помилка при відправці логів: {e}")
         logger.error(f"Помилка при відправці логів: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Функція для очищення старих логів
 def cleanup_old_logs():
-    """Видаляє ВСІ старі лог-файли (крім поточного)"""
+    """Видаляє лог-файли старіші за 1 день (крім поточного), ТІЛЬКИ якщо вони вже є на S3"""
+    global storage_manager
+
+    if not storage_manager:
+        logger.warning("⚠️ StorageManager не ініціалізовано, пропускаю очищення логів")
+        return
+
     try:
         current_log = get_log_filename()
         deleted_count = 0
+        skipped_count = 0
+
+        # Обчислюємо дату 1 день тому
+        one_day_ago = datetime.now() - timedelta(days=1)
+
+        # ВАЖЛИВО: Закриваємо всі старі file handlers перед видаленням
+        # Інакше Python тримає файли відкритими і Windows не дозволить їх видалити
+        root_logger = logging.getLogger()
+        handlers_to_remove = []
+        for handler in root_logger.handlers[:]:
+            if isinstance(handler, logging.FileHandler):
+                # Перевіряємо чи це не поточний лог
+                if hasattr(handler, 'baseFilename'):
+                    handler_file = os.path.basename(handler.baseFilename)
+                    if handler_file != current_log:
+                        handlers_to_remove.append(handler)
+
+        # Закриваємо та видаляємо старі handlers
+        for handler in handlers_to_remove:
+            handler.close()
+            root_logger.removeHandler(handler)
+            logger.info(f"🔒 Закрито handler для: {os.path.basename(handler.baseFilename)}")
 
         # Знаходимо всі лог-файли
         log_files = [f for f in os.listdir('.') if f.startswith('bot_') and f.endswith('.log')]
+
+        # Перевіряємо які файли вже на S3
+        try:
+            remote_log_files = storage_manager.storage.list_files(prefix='logs/')
+            # Видаляємо префікс 'logs/' зі списку та розширення .gz
+            remote_log_names = [f.split('/')[-1].replace('.gz', '').replace('.log', '') for f in remote_log_files if '/logs/' in f or f.startswith('logs/')]
+            logger.info(f"📋 Знайдено {len(remote_log_names)} лог-файлів на S3")
+        except Exception as e:
+            logger.warning(f"⚠️ Не вдалося отримати список файлів з S3: {e}")
+            remote_log_names = []
 
         for log_file in log_files:
             # Не видаляємо поточний лог-файл
@@ -704,19 +1524,38 @@ def cleanup_old_logs():
                 continue
 
             try:
-                os.remove(log_file)
-                deleted_count += 1
-                logger.info(f"🗑️ Видалено старий лог: {log_file}")
-            except Exception as e:
-                logger.warning(f"Не вдалося видалити файл {log_file}: {e}")
+                # Перевіряємо дату файлу - видаляємо тільки якщо старіший за 1 день
+                file_stat = os.stat(log_file)
+                file_mtime = datetime.fromtimestamp(file_stat.st_mtime)
 
+                if file_mtime >= one_day_ago:
+                    logger.debug(f"⏭️ Пропускаю файл {log_file} (не старіший за 1 день)")
+                    continue
+                # Перевіряємо чи файл вже є на S3 (з .gz або без)
+                log_name_base = log_file.replace('.log', '')
+                is_on_s3 = any(log_name_base in remote_name for remote_name in remote_log_names)
+
+                # ТІЛЬКИ видаляємо якщо файл вже на S3
+                if is_on_s3:
+                    os.remove(log_file)
+                    deleted_count += 1
+                    logger.info(f"🗑️ Видалено старий лог (вже на S3): {log_file}")
+                else:
+                    skipped_count += 1
+                    logger.info(f"⏭️ Пропускаю {log_file} (ще не завантажено на S3)")
+            except Exception as e:
+                logger.warning(f"Не вдалося обробити файл {log_file}: {e}")
+
+        # Підсумок
         if deleted_count > 0:
-            logger.info(f"✅ Видалено {deleted_count} старих лог-файлів")
-        else:
-            logger.debug("📁 Немає старих лог-файлів для видалення")
+            logger.info(f"✅ Видалено локально: {deleted_count} старих лог-файлів")
+        if skipped_count > 0:
+            logger.info(f"⏭️ Пропущено: {skipped_count} файлів (не завантажені на S3)")
+        if deleted_count == 0 and skipped_count == 0:
+            logger.info("📁 Немає старих лог-файлів для видалення")
 
     except Exception as e:
-        logger.error(f"❌ Помилка при очищенні логів: {e}")
+        logger.error(f"❌ Помилка при очищенні старих логів: {e}")
 
 # Глобальна змінна для event loop
 main_loop: asyncio.AbstractEventLoop | None = None
@@ -742,12 +1581,32 @@ def auto_scan_sync():
     else:
         logger.warning("Event loop не доступний для сканування")
 
+# Функція для завантаження медіа (синхронна, для планувальника)
+def upload_media_sync():
+    """Завантажує медіа на S3 (викликається планувальником)"""
+    try:
+        if media_manager:
+            logger.info("📤 Планувальник: Початок завантаження медіа...")
+            stats = media_manager.upload_media_to_storage()
+            logger.info(f"📊 Медіа завантажено: {stats['uploaded']} файлів, видалено локально: {stats['deleted_local']}")
+            if stats['failed'] > 0:
+                logger.warning(f"⚠️ Помилок при завантаженні: {stats['failed']}")
+        else:
+            logger.warning("MediaManager не ініціалізовано")
+    except Exception as e:
+        logger.error(f"❌ Помилка завантаження медіа: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+
 # Планувальник для щоденного завантаження
 def setup_scheduler():
     scheduler = BackgroundScheduler()
 
     # Запускаємо о 23:59 кожного дня
     scheduler.add_job(upload_to_storage_box_sync, 'cron', hour=23, minute=59)
+
+    # Завантажуємо медіа на S3 о 23:59 (разом з бекапом)
+    scheduler.add_job(upload_media_sync, 'cron', hour=23, minute=59)
 
     # Відправляємо логи о 23:58 (перед бекапом повідомлень)
     scheduler.add_job(upload_logs_sync, 'cron', hour=23, minute=58)
@@ -759,6 +1618,7 @@ def setup_scheduler():
     scheduler.start()
     logger.info("Планувальник запущено:")
     logger.info("- Щоденне резервне копіювання о 23:59")
+    logger.info("- Завантаження медіа на S3 о 23:59")
     logger.info("- Відправка логів на сервер о 23:58")
     logger.info("- Очищення старих логів та файлів о 01:00")
     logger.info("- Швидка перевірка повідомлень кожні 0.5 секунди")
@@ -772,7 +1632,7 @@ client_app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     in_memory=False,  # Зберігаємо сесію на диску
-    workers=1  # Один воркер для простоти
+    workers=4  # Більше воркерів для обробки повідомлень в реальному часі
 )
 
 # Глобальний лічільник для тестування
@@ -793,22 +1653,37 @@ def save_last_message_id(message_id):
 
 async def quick_message_check():
     """Швидка перевірка нових повідомлень кожні 0.5 секунди"""
+    global message_ids_cache
+
     try:
+        today = datetime.now().date()
+
+        # OPTIMIZATION: Initialize cache once on first run
+        initialize_message_cache()
+
         last_saved_id = get_last_message_id()
         new_messages_count = 0
         latest_message_id = last_saved_id
 
-        # Завантажуємо існуючі повідомлення один раз для швидкості
-        data = load_messages()
-        existing_ids = set(msg['message_id'] for msg in data['messages'])
+        # OPTIMIZATION: Use in-memory cache instead of loading from file (100x faster)
+        existing_ids = message_ids_cache
 
         # Перевіряємо "Збережені повідомлення" без ліміту
         # Але зупиняємося коли знаходимо старе повідомлення
         if settings['save_saved_messages']:
             async for message in client_app.get_chat_history("me"):
-                # Пропускаємо повідомлення без тексту
-                if not message.text:
+                # Пропускаємо повідомлення без дати
+                if not message.date:
                     continue
+
+                # Пропускаємо порожні повідомлення (без тексту і без медіа)
+                if not message.text and not message.photo and not message.video and not message.document and not message.audio and not message.voice and not message.sticker and not message.animation:
+                    continue
+
+                # ВАЖЛИВО: Зберігаємо тільки сьогоднішні повідомлення!
+                if message.date.date() < today:
+                    logger.debug(f"⏭️ Saved Messages: пропускаю старе повідомлення {message.id} з {message.date.date()}")
+                    break  # Оскільки повідомлення йдуть від нових до старих, далі будуть ще старіші
 
                 # Зупиняємося коли дійшли до останнього збереженого повідомлення
                 if message.id <= last_saved_id:
@@ -816,11 +1691,18 @@ async def quick_message_check():
 
                 # Перевіряємо чи не збережено вже (для надійності)
                 if message.id not in existing_ids:
-                    logger.info(f"⚡ ШВИДКЕ ЗБЕРЕЖЕННЯ (Saved): {message.id} - {message.text[:50]}...")
+                    has_media = message.photo or message.video or message.document or message.audio or message.voice or message.sticker or message.animation
+                    if message.text:
+                        text_preview = message.text[:50]
+                    elif has_media:
+                        text_preview = f"[Media: {message.media}]"
+                    else:
+                        text_preview = "[Empty]"
+                    logger.info(f"⚡ ШВИДКЕ ЗБЕРЕЖЕННЯ (Saved): {message.id} - {text_preview}...")
 
                     message_data = {
                         "message_id": message.id,
-                        "chat_id": message.chat.id,
+                        "chat_id": message.chat.id if message.chat else ALLOWED_USER_ID,
                         "chat_type": "SAVED_MESSAGES",
                         "chat_title": "Збережені повідомлення",
                         "chat_username": None,
@@ -828,10 +1710,14 @@ async def quick_message_check():
                         "from_username": message.from_user.username if message.from_user else None,
                         "from_first_name": message.from_user.first_name if message.from_user else "Me",
                         "text": message.text,
-                        "date": message.date.isoformat(),
+                        "date": message.date.isoformat() if message.date else datetime.now().isoformat(),
                         "is_outgoing": (message.from_user.id == ALLOWED_USER_ID) if message.from_user else True,
                         "is_edited": False
                     }
+
+                    # Зберігаємо медіа якщо є
+                    if has_media and media_manager:
+                        message_data = await media_manager.save_media(message, message_data)
 
                     save_message(message_data)
                     new_messages_count += 1
@@ -851,14 +1737,17 @@ async def quick_message_check():
             logger.info(f"⚡ Швидко збережено {new_messages_count} повідомлень!")
 
     except Exception as e:
-        logger.error(f"❌ Помилка швидкої перевірки: {e}")
+        # Логуємо помилку тільки в DEBUG режимі, щоб не засмічувати консоль
+        logger.debug(f"❌ Помилка швидкої перевірки: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
 
 # Глобальна змінна для відстеження останньої перевірки діалогів
 last_dialogs_check = 0
 
 async def check_private_chats():
     """Перевірка приватних чатів кожні 5 секунд"""
-    global last_dialogs_check
+    global last_dialogs_check, message_ids_cache
 
     try:
         # Перевіряємо тільки якщо увімкнено збереження приватних чатів
@@ -873,9 +1762,8 @@ async def check_private_chats():
 
         last_dialogs_check = current_time
 
-        # Завантажуємо існуючі повідомлення
-        data = load_messages()
-        existing_ids = set(msg['message_id'] for msg in data['messages'])
+        # OPTIMIZATION: Use in-memory cache instead of loading from file
+        existing_ids = message_ids_cache
         new_messages_count = 0
 
         # Перевіряємо останні діалоги з налаштованою кількістю
@@ -906,18 +1794,38 @@ async def check_private_chats():
             # Перевіряємо останні повідомлення з цього чату (з налаштуванням)
             try:
                 message_count = 0
+                # Отримуємо сьогоднішню дату (без часу) для фільтрації
+                today = datetime.now().date()
+
                 async for message in client_app.get_chat_history(chat.id, limit=settings['messages_per_dialog']):
                     message_count += 1
 
-                    # Пропускаємо повідомлення без тексту
-                    if not message.text:
+                    # Пропускаємо повідомлення без дати
+                    if not message.date:
+                        continue
+
+                    # Пропускаємо порожні повідомлення (без тексту і без медіа)
+                    if not message.text and not message.photo and not message.video and not message.document and not message.audio and not message.voice and not message.sticker and not message.animation:
+                        continue
+
+                    # ВАЖЛИВО: Зберігаємо тільки сьогоднішні повідомлення!
+                    # Інакше при першому запуску збереться вся історія
+                    if message.date.date() < today:
+                        logger.debug(f"⏭️ Пропускаю старе повідомлення {message.id} з {message.date.date()}")
                         continue
 
                     # Перевіряємо чи не збережено вже
                     if message.id in existing_ids:
                         continue
 
-                    logger.info(f"⚡ ШВИДКЕ ЗБЕРЕЖЕННЯ (Private): {message.id} від {chat.id} - {message.text[:50]}...")
+                    has_media = message.photo or message.video or message.document or message.audio or message.voice or message.sticker or message.animation
+                    if message.text:
+                        text_preview = message.text[:50]
+                    elif has_media:
+                        text_preview = f"[Media: {message.media}]"
+                    else:
+                        text_preview = "[Empty]"
+                    logger.info(f"⚡ ШВИДКЕ ЗБЕРЕЖЕННЯ (Private): {message.id} від {chat.id} - {text_preview}...")
 
                     # Визначаємо тип чату та назву
                     chat_type = str(chat.type)
@@ -940,10 +1848,14 @@ async def check_private_chats():
                         "from_username": message.from_user.username if message.from_user else None,
                         "from_first_name": message.from_user.first_name if message.from_user else "Unknown",
                         "text": message.text,
-                        "date": message.date.isoformat(),
+                        "date": message.date.isoformat() if message.date else datetime.now().isoformat(),
                         "is_outgoing": (message.from_user.id == ALLOWED_USER_ID) if message.from_user else False,
                         "is_edited": False
                     }
+
+                    # Зберігаємо медіа якщо є
+                    if has_media and media_manager:
+                        message_data = await media_manager.save_media(message, message_data)
 
                     save_message(message_data)
                     new_messages_count += 1
@@ -980,15 +1892,15 @@ async def message_checker_loop():
             logger.error(f"❌ Помилка в циклі перевірки: {e}")
             await asyncio.sleep(1)  # При помилці чекаємо довше
 
-# Обробник RAW updates для миттєвого отримання повідомлень
+# Обробник RAW updates для миттєвого отримання повідомлень (тільки логування, НЕ збільшуємо counter!)
 @client_app.on_raw_update()
 async def handle_raw_update(_client: Client, update, users, _chats):
-    global message_counter
+    # НЕ збільшуємо message_counter тут, тому що @on_message() вже це робить!
 
     try:
         # Логуємо ТИП оновлення для діагностики
         update_type = type(update).__name__
-        logger.info(f"🔍 RAW UPDATE TYPE: {update_type}")
+        logger.debug(f"🔍 RAW UPDATE TYPE: {update_type}")
 
         # Обробляємо різні типи оновлень
         message_to_process = None
@@ -1030,10 +1942,10 @@ async def handle_raw_update(_client: Client, update, users, _chats):
                 })()
                 logger.info("   📨 Створено псевдо-повідомлення з UpdateShortMessage")
 
-        # Обробляємо знайдене повідомлення
+        # Обробляємо знайдене повідомлення (тільки логування, НЕ збільшуємо counter!)
         if message_to_process:
-            message_counter += 1
-            logger.info(f"🔥 ОБРОБЛЯЄМО ПОВІДОМЛЕННЯ #{message_counter}")
+            # НЕ збільшуємо message_counter - це робить @on_message()
+            logger.debug(f"🔥 RAW UPDATE містить повідомлення")
 
             # Отримуємо ID повідомлення
             msg_id = getattr(message_to_process, 'id', None)
@@ -1142,18 +2054,21 @@ def should_save_message(message: Message) -> bool:
     return False
 
 # Резервний обробник для звичайних повідомлень
-@client_app.on_message()
+@client_app.on_message(group=0)
 async def handle_regular_messages(_client: Client, message: Message):
     try:
         global message_counter
         message_counter += 1
 
-        logger.info(f"📱 ЗВИЧАЙНИЙ ОБРОБНИК! Повідомлення #{message_counter}")
+        # ВАЖЛИВЕ логування для діагностики
+        logger.info("=" * 80)
+        logger.info(f"📱 ЗВИЧАЙНИЙ ОБРОБНИК СПРАЦЮВАВ! Повідомлення #{message_counter}")
         logger.info(f"📨 ID: {message.id}")
-        logger.info(f"📝 Text: {message.text}")
+        logger.info(f"📝 Text: {message.text[:50] if message.text else 'None'}")
         logger.info(f"💬 Chat: {message.chat.id} ({message.chat.type})")
         logger.info(f"👤 From: {message.from_user.id if message.from_user else 'None'}")
-        logger.info(f"📤 Outgoing: {getattr(message, 'outgoing', 'Unknown')}")
+        logger.info(f"📤 Outgoing: {message.outgoing}")
+        logger.info("=" * 80)
 
         # Перевіряємо чи потрібно зберігати повідомлення з цього чату
         if not should_save_message(message):
@@ -1228,9 +2143,62 @@ async def start(update: Update, _context: ContextType) -> None:
             "📱 **Client API** зберігає всі ваші повідомлення автоматично\n"
             "🤖 **Bot API** дозволяє керувати процесом\n"
             "🧠 **AI Помічник** аналізує та виправляє помилки\n\n"
-            "Використовуйте кнопки нижче для керування ботом! 👇",
+            "Використовуйте кнопки нижче для керування ботом! 👇\n\n"
+            "💡 Натисніть /commands щоб побачити всі доступні команди",
             reply_markup=get_main_keyboard(),
             parse_mode='Markdown'
+        )
+
+async def commands(update: Update, _context: ContextType) -> None:
+    """Показує список всіх доступних команд бота"""
+    user_id = update.effective_user.id
+    if not check_access(user_id):
+        if update.message:
+            await update.message.reply_text("Вибачте, у вас немає доступу до цього бота.")
+        return
+
+    commands_text = """📋 **ВСІХ ДОСТУПНІ КОМАНДИ БОТА**
+
+🎯 **Основні команди:**
+/start - Початок роботи та головне меню
+/commands - Список всіх команд (ця команда)
+/status - Статус збережених повідомлень за сьогодні
+/settings - Налаштування бота
+
+💾 **Бекап та файли:**
+/backup - Миттєве резервне копіювання
+/history - Перегляд історії файлів на сервері
+/uploadlogs - Відправити логи на сервер
+/cleanlogs - Очистити старі лог-файли
+/cleanfiles - Очистити старі локальні файли
+
+🔍 **Сканування:**
+/scan - Повне сканування повідомлень за день
+/autoscan - Статус автоматичного сканування
+
+🤖 **AI Помічник:**
+/analyzecode - AI аналіз коду бота
+/optstats - Статистика системи оптимізації
+
+🔧 **Технічні команди:**
+/clientstatus - Статус Pyrogram Client API
+/test - Тест підключення Client API
+/debug - Технічна інформація про налаштування
+/myuuid - Показати ваш UUID (для доступу)
+/teststorage - Тест підключення до сховища
+/testbackup - Тест бекапу на сервер
+
+⌨️ **Клавіатура:**
+Використовуйте кнопки нижче для швидкого доступу до функцій!
+
+📚 **Документація:**
+Детальніше про всі функції дивіться в документації проєкту."""
+
+    if update.message:
+        await update.message.reply_text(
+            commands_text,
+            parse_mode='Markdown',
+            reply_markup=get_main_keyboard()
         )
 
 async def status(update: Update, _context: ContextType) -> None:
@@ -1288,26 +2256,35 @@ async def view_history(update: Update, context: ContextType) -> None:
 async def list_files(update: Update, context: ContextType, page: int = 0) -> None:
     user_id = update.effective_user.id
 
-    # Отримуємо список файлів з Storage Box
-    storage_box = StorageBoxManager()
-    if not storage_box.connect():
+    if not storage_manager:
         if update.message:
-            await update.message.reply_text("❌ Не вдалося підключитися до Storage Box")
+            await update.message.reply_text("❌ StorageManager не ініціалізовано!")
         return
 
-    files = storage_box.list_files()
-    storage_box.close()
+    # Отримуємо список файлів зі сховища
+    try:
+        if not storage_manager.connect():
+            if update.message:
+                await update.message.reply_text(f"❌ Не вдалося підключитися до сховища ({storage_manager.storage_type.upper()})")
+            return
 
-    if not files:
+        files = storage_manager.list_files()
+        storage_manager.close()
+
+        if not files:
+            if update.message:
+                await update.message.reply_text("📁 Файлів не знайдено.")
+            return
+
+        # Зберігаємо файли в кеш для цього користувача
+        files_cache[str(user_id)] = files
+
+        # Відображаємо файли з пагінацією
+        await show_files_page(update, context, page, files)
+    except Exception as e:
+        logger.error(f"❌ Помилка отримання списку файлів: {e}")
         if update.message:
-            await update.message.reply_text("📁 Файлів не знайдено.")
-        return
-
-    # Зберігаємо файли в кеш для цього користувача
-    files_cache[str(user_id)] = files
-
-    # Відображаємо файли з пагінацією
-    await show_files_page(update, context, page, files)
+            await update.message.reply_text(f"❌ Помилка: {str(e)}")
 
 async def show_files_page(update: Update, _context: ContextType, page: int, files: List[str]) -> None:
     # Розраховуємо пагінацію
@@ -1610,34 +2587,44 @@ async def view_file(update: Update, _context: ContextType, filename: str, page: 
     # Перевіряємо чи файл вже в кеші
     cache_key = f"{user_id}_{filename}"
     if cache_key not in user_viewing_state:
-        # Скачуємо файл з Storage Box
-        storage_box = StorageBoxManager()
-        if not storage_box.connect():
+        if not storage_manager:
             if update.callback_query and update.callback_query.message and isinstance(update.callback_query.message, TelegramMessage):
-                await update.callback_query.message.reply_text("❌ Не вдалося підключитися до Storage Box")
+                await update.callback_query.message.reply_text("❌ StorageManager не ініціалізовано!")
             return
 
-        local_path = storage_box.download_file(filename)
-        storage_box.close()
+        # Скачуємо файл зі сховища
+        try:
+            if not storage_manager.connect():
+                if update.callback_query and update.callback_query.message and isinstance(update.callback_query.message, TelegramMessage):
+                    await update.callback_query.message.reply_text(f"❌ Не вдалося підключитися до сховища ({storage_manager.storage_type.upper()})")
+                return
 
-        if not local_path:
+            local_path = storage_manager.download_file(filename)
+            storage_manager.close()
+
+            if not local_path:
+                if update.callback_query and update.callback_query.message and isinstance(update.callback_query.message, TelegramMessage):
+                    await update.callback_query.message.reply_text("❌ Не вдалося завантажити файл.")
+                return
+
+            # Завантажуємо дані з файлу
+            with open(local_path, 'r', encoding='utf-8') as f:
+                file_data = json.load(f)
+
+            # Видаляємо тимчасовий файл
+            if os.path.exists(local_path):
+                os.remove(local_path)
+
+            # Зберігаємо в кеш
+            user_viewing_state[cache_key] = {
+                'filename': filename,
+                'messages': file_data.get('messages', [])
+            }
+        except Exception as e:
+            logger.error(f"❌ Помилка завантаження файлу: {e}")
             if update.callback_query and update.callback_query.message and isinstance(update.callback_query.message, TelegramMessage):
-                await update.callback_query.message.reply_text("❌ Не вдалося завантажити файл.")
+                await update.callback_query.message.reply_text(f"❌ Помилка: {str(e)}")
             return
-
-        # Завантажуємо дані з файлу
-        with open(local_path, 'r', encoding='utf-8') as f:
-            file_data = json.load(f)
-
-        # Видаляємо тимчасовий файл
-        if os.path.exists(local_path):
-            os.remove(local_path)
-
-        # Зберігаємо в кеш
-        user_viewing_state[cache_key] = {
-            'filename': filename,
-            'messages': file_data.get('messages', [])
-        }
 
     # Отримуємо дані з кешу
     messages = user_viewing_state[cache_key]['messages']
@@ -1717,19 +2704,29 @@ async def view_file(update: Update, _context: ContextType, filename: str, page: 
 
 async def download_file_to_user(update: Update, _context: ContextType, filename: str) -> None:
     """Завантажує файл користувачу"""
-    # Скачуємо файл з Storage Box
-    storage_box = StorageBoxManager()
-    if not storage_box.connect():
+    if not storage_manager:
         if update.callback_query and update.callback_query.message and isinstance(update.callback_query.message, TelegramMessage):
-            await update.callback_query.message.reply_text("❌ Не вдалося підключитися до Storage Box")
+            await update.callback_query.message.reply_text("❌ StorageManager не ініціалізовано!")
         return
 
-    local_path = storage_box.download_file(filename)
-    storage_box.close()
+    # Скачуємо файл зі сховища
+    try:
+        if not storage_manager.connect():
+            if update.callback_query and update.callback_query.message and isinstance(update.callback_query.message, TelegramMessage):
+                await update.callback_query.message.reply_text(f"❌ Не вдалося підключитися до сховища ({storage_manager.storage_type.upper()})")
+            return
 
-    if not local_path:
+        local_path = storage_manager.download_file(filename)
+        storage_manager.close()
+
+        if not local_path:
+            if update.callback_query and update.callback_query.message and isinstance(update.callback_query.message, TelegramMessage):
+                await update.callback_query.message.reply_text("❌ Не вдалося завантажити файл.")
+            return
+    except Exception as e:
+        logger.error(f"❌ Помилка завантаження файлу: {e}")
         if update.callback_query and update.callback_query.message and isinstance(update.callback_query.message, TelegramMessage):
-            await update.callback_query.message.reply_text("❌ Не вдалося завантажити файл.")
+            await update.callback_query.message.reply_text(f"❌ Помилка: {str(e)}")
         return
 
     # Відправляємо файл користувачу
@@ -1838,7 +2835,8 @@ async def fetch_recent_messages():
 
             # Перевіряємо чи це повідомлення ще не збережено
             if message.id not in existing_ids:
-                logger.info(f"💾 Зберігаємо нове повідомлення: {message.id} - {message.text[:50]}...")
+                text_preview = message.text[:50] if message.text else "[No text]"
+                logger.info(f"💾 Зберігаємо нове повідомлення: {message.id} - {text_preview}...")
 
                 message_data = {
                     "message_id": message.id,
@@ -1910,7 +2908,8 @@ async def fetch_recent_messages():
                                 if hasattr(chat, 'last_name') and chat.last_name:
                                     chat_title += f" {chat.last_name}"
 
-                        logger.info(f"💾 Зберігаємо з {chat_title}: {message.id} - {message.text[:50]}...")
+                        text_preview = message.text[:50] if message.text else "[No text]"
+                        logger.info(f"💾 Зберігаємо з {chat_title}: {message.id} - {text_preview}...")
 
                         message_data = {
                             "message_id": message.id,
@@ -1960,52 +2959,61 @@ async def test_client(update: Update, _context: ContextType) -> None:
         if update.message:
             await update.message.reply_text("🧪 Надсилаю тестове повідомлення...")
 
+        # Перевіряємо кількість повідомлень ДО відправки
+        old_messages_count = len(load_messages()['messages'])
+
         # Надсилаємо повідомлення собі
         test_msg = await client_app.send_message("me", f"🧪 Тест #{message_counter + 1} від Client API")
 
-        # Чекаємо трохи
-        await asyncio.sleep(2)
+        # Чекаємо щоб обробник або циклічна перевірка спрацювали
+        await asyncio.sleep(3)
 
-        # Перевіряємо чи збільшився лічільник (через обробники)
+        # Перевіряємо чи збільшився лічільник (через @on_message обробник)
         new_counter = message_counter
+        handler_works = new_counter > old_counter
 
-        # Принудово отримуємо повідомлення
-        if update.message:
-            await update.message.reply_text("🔍 Принудово отримую повідомлення...")
-        old_messages_count = len(load_messages()['messages'])
-
-        await fetch_recent_messages()
-
+        # Перевіряємо чи повідомлення додалося в файл (може через обробник АБО quick_check)
         new_messages_count = len(load_messages()['messages'])
+        message_saved = new_messages_count > old_messages_count
+
+        # Перевіряємо чи наше повідомлення є в файлі
+        data = load_messages()
+        test_msg_found = any(msg['message_id'] == test_msg.id for msg in data['messages'])
 
         if update.message:
-            await update.message.reply_text(
-                f"✅ **Результат тесту:**\n\n"
-                f"👤 Підключений як: {me.first_name} (@{me.username})\n"
-                f"📤 Надіслано повідомлення ID: {test_msg.id}\n\n"
-                f"**Обробники повідомлень:**\n"
-                f"🔢 Лічільник до: {old_counter}\n"
-                f"🔢 Лічільник після: {new_counter}\n"
-                f"📊 Різниця: {new_counter - old_counter}\n"
-                f"{'✅ Обробники працюють!' if new_counter > old_counter else '❌ Обробники НЕ працюють!'}\n\n"
-                f"**Принудове отримання:**\n"
-                f"📁 Повідомлень до: {old_messages_count}\n"
-                f"📁 Повідомлень після: {new_messages_count}\n"
-                f"📊 Додано: {new_messages_count - old_messages_count}\n"
-                f"{'✅ Принудове отримання працює!' if new_messages_count > old_messages_count else '❌ Принудове отримання НЕ працює!'}",
-                parse_mode='Markdown'
-            )
+            # Використовуємо HTML замість Markdown щоб уникнути проблем з @ символом
+            status_text = f"✅ <b>Результат тесту:</b>\n\n"
+            status_text += f"👤 Підключений як: {me.first_name} (@{me.username})\n"
+            status_text += f"📤 Надіслано повідомлення ID: {test_msg.id}\n\n"
+
+            status_text += f"<b>@on_message() обробник:</b>\n"
+            status_text += f"🔢 Лічільник до: {old_counter}\n"
+            status_text += f"🔢 Лічільник після: {new_counter}\n"
+            status_text += f"📊 Різниця: {new_counter - old_counter}\n"
+            status_text += f"{'✅ Обробник спрацював!' if handler_works else '⚠️ Обробник НЕ спрацював (але може працювати quick_check)'}\n\n"
+
+            status_text += f"<b>Збереження повідомлення:</b>\n"
+            status_text += f"📁 Повідомлень до: {old_messages_count}\n"
+            status_text += f"📁 Повідомлень після: {new_messages_count}\n"
+            status_text += f"📊 Додано: {new_messages_count - old_messages_count}\n"
+            status_text += f"🔍 Тестове повідомлення знайдено: {'✅ Так' if test_msg_found else '❌ Ні'}\n"
+            status_text += f"{'✅ Повідомлення збережено!' if message_saved and test_msg_found else '❌ Повідомлення НЕ збережено!'}\n\n"
+
+            if not handler_works and message_saved:
+                status_text += f"ℹ️ <b>Примітка:</b> Повідомлення збережено через quick_message_check(), а не через @on_message()\n"
+
+            await update.message.reply_text(status_text, parse_mode='HTML')
 
         # Перевіряємо файл
         data = load_messages()
         current_file = get_current_data_file()
         if update.message:
             await update.message.reply_text(
-                f"📁 **Стан файлу:**\n"
-            f"📄 Файл: `{current_file}`\n"
+                f"📁 <b>Стан файлу:</b>\n"
+            f"📄 Файл: <code>{current_file}</code>\n"
             f"📊 Повідомлень у файлі: {len(data['messages'])}\n"
             f"💾 Файл існує: {os.path.exists(current_file)}",
-            parse_mode='Markdown'
+            parse_mode='HTML'
         )
 
     except Exception as test_exc:
@@ -2176,29 +3184,63 @@ async def test_storage_connection(update: Update, _context: ContextType) -> None
             await update.message.reply_text("Вибачте, у вас немає доступу до цього бота.")
         return
 
+    if not storage_manager:
+        if update.message:
+            await update.message.reply_text("❌ StorageManager не ініціалізовано!")
+        return
+
+    storage_type = storage_manager.storage_type.upper()
+
     if update.message:
-        await update.message.reply_text("🔄 Тестую підключення до Storage Box...")
+        await update.message.reply_text(f"🔄 Тестую підключення до сховища ({storage_type})...")
 
-    storage_box = StorageBoxManager()
-    if storage_box.connect():
-        files = storage_box.list_files()
-        storage_box.close()
+    try:
+        if storage_manager.connect():
+            files = storage_manager.list_files()
+            storage_manager.close()
 
+            if storage_type == "S3":
+                info_text = (
+                    f"✅ Підключення успішне!\n"
+                    f"📁 Знайдено файлів: {len(files)}\n"
+                    f"☁️ Тип: Object Storage (S3)\n"
+                    f"🪣 Bucket: {os.getenv('S3_BUCKET_NAME')}\n"
+                    f"🌐 Endpoint: {os.getenv('S3_ENDPOINT_URL')}"
+                )
+            else:
+                info_text = (
+                    f"✅ Підключення успішне!\n"
+                    f"📁 Знайдено файлів: {len(files)}\n"
+                    f"💾 Тип: SFTP Storage Box\n"
+                    f"🌐 Сервер: {STORAGE_BOX_HOST}\n"
+                    f"👤 Користувач: {STORAGE_BOX_USERNAME}"
+                )
+
+            if update.message:
+                await update.message.reply_text(info_text)
+        else:
+            if storage_type == "S3":
+                error_text = (
+                    f"❌ Помилка підключення!\n"
+                    f"☁️ Тип: Object Storage (S3)\n"
+                    f"🪣 Bucket: {os.getenv('S3_BUCKET_NAME')}\n"
+                    f"🌐 Endpoint: {os.getenv('S3_ENDPOINT_URL')}"
+                )
+            else:
+                error_text = (
+                    f"❌ Помилка підключення!\n"
+                    f"💾 Тип: SFTP Storage Box\n"
+                    f"🌐 Сервер: {STORAGE_BOX_HOST}\n"
+                    f"👤 Користувач: {STORAGE_BOX_USERNAME}\n"
+                    f"📂 Шлях: {STORAGE_BOX_PATH}"
+                )
+
+            if update.message:
+                await update.message.reply_text(error_text)
+    except Exception as e:
+        logger.error(f"❌ Помилка тестування сховища: {e}")
         if update.message:
-            await update.message.reply_text(
-                f"✅ Підключення успішне!\n"
-                f"📁 Знайдено файлів: {len(files)}\n"
-                f"🌐 Сервер: {STORAGE_BOX_HOST}\n"
-            f"👤 Користувач: {STORAGE_BOX_USERNAME}"
-        )
-    else:
-        if update.message:
-            await update.message.reply_text(
-                f"❌ Помилка підключення!\n"
-                f"🌐 Сервер: {STORAGE_BOX_HOST}\n"
-                f"👤 Користувач: {STORAGE_BOX_USERNAME}\n"
-                f"📂 Шлях: {STORAGE_BOX_PATH}"
-            )
+            await update.message.reply_text(f"❌ Помилка: {str(e)}")
 
 async def test_backup(update: Update, _context: ContextType) -> None:
     user_id = update.effective_user.id
@@ -2207,10 +3249,18 @@ async def test_backup(update: Update, _context: ContextType) -> None:
             await update.message.reply_text("Вибачте, у вас немає доступу до цього бота.")
         return
 
+    if not storage_manager:
+        if update.message:
+            await update.message.reply_text("❌ StorageManager не ініціалізовано!")
+        return
+
+    storage_type = storage_manager.storage_type.upper()
+
     # Створюємо тестовий файл
     test_data = {
         "test": True,
         "timestamp": datetime.now().isoformat(),
+        "storage_type": storage_type,
         "messages": [
             {
                 "message_id": 999999,
@@ -2224,20 +3274,37 @@ async def test_backup(update: Update, _context: ContextType) -> None:
     with open(test_file, 'w', encoding='utf-8') as f:
         json.dump(test_data, f, ensure_ascii=False, indent=4)
 
-    await update.message.reply_text("🔄 Завантажую тестовий файл...")
+    if update.message:
+        await update.message.reply_text(f"🔄 Завантажую тестовий файл на {storage_type}...")
 
-    storage_box = StorageBoxManager()
-    if storage_box.connect():
-        success = storage_box.upload_file(test_file, f"test_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-        storage_box.close()
+    try:
+        if storage_manager.connect():
+            remote_filename = f"test_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            success = storage_manager.upload_file(test_file, remote_filename)
+            storage_manager.close()
 
-        if success:
-            await update.message.reply_text("✅ Тестовий бекап успішний!")
-            os.remove(test_file)  # Видаляємо локальний тестовий файл
+            if success:
+                if update.message:
+                    await update.message.reply_text(
+                        f"✅ Тестовий бекап успішний!\n"
+                        f"☁️ Тип сховища: {storage_type}\n"
+                        f"📁 Файл: {remote_filename}"
+                    )
+                os.remove(test_file)  # Видаляємо локальний тестовий файл
+            else:
+                if update.message:
+                    await update.message.reply_text(f"❌ Помилка завантаження тестового файлу на {storage_type}")
+                os.remove(test_file)
         else:
-            await update.message.reply_text("❌ Помилка завантаження тестового файлу")
-    else:
-        await update.message.reply_text("❌ Не вдалося підключитися до Storage Box")
+            if update.message:
+                await update.message.reply_text(f"❌ Не вдалося підключитися до сховища ({storage_type})")
+            os.remove(test_file)
+    except Exception as e:
+        logger.error(f"❌ Помилка тестового бекапу: {e}")
+        if update.message:
+            await update.message.reply_text(f"❌ Помилка: {str(e)}")
+        if os.path.exists(test_file):
+            os.remove(test_file)
 
 async def upload_logs_command(update: Update, _context: ContextType) -> None:
     """Команда для ручної відправки логів на сервер"""
@@ -2247,13 +3314,15 @@ async def upload_logs_command(update: Update, _context: ContextType) -> None:
             await update.message.reply_text("Вибачте, у вас немає доступу до цього бота.")
         return
 
+    storage_type = storage_manager.storage_type.upper() if storage_manager else "невідомий"
+
     if update.message:
-        await update.message.reply_text("📤 Відправляю логи на Storage Box...")
+        await update.message.reply_text(f"📤 Відправляю логи на сховище ({storage_type})...")
 
     await upload_logs_to_storage_box()
 
     if update.message:
-        await update.message.reply_text("✅ Логи відправлено на сервер!")
+        await update.message.reply_text(f"✅ Логи відправлено на сховище ({storage_type})!")
 
 async def cleanup_logs_command(update: Update, _context: ContextType) -> None:
     """Команда для ручного очищення старих логів"""
@@ -2531,6 +3600,7 @@ async def handle_keyboard(update: Update, context: ContextType) -> None:
 
 # Додавання обробників до бота
 bot_app.add_handler(CommandHandler("start", start, ))
+bot_app.add_handler(CommandHandler("commands", commands, ))
 bot_app.add_handler(CommandHandler("status", status, ))
 bot_app.add_handler(CommandHandler("settings", settings_command, ))
 bot_app.add_handler(CommandHandler("backup", backup_now, ))
@@ -2555,12 +3625,39 @@ async def main():
     global main_loop
     main_loop = asyncio.get_running_loop()
 
+    # Встановлюємо custom exception handler для придушення "Task was destroyed" помилок
+    def asyncio_exception_handler(loop, context):
+        exception = context.get('exception')
+        message = context.get('message', '')
+
+        # Ігноруємо "Task was destroyed" помилки від Pyrogram
+        if 'Task was destroyed but it is pending' in message:
+            return  # Просто ігноруємо
+
+        # Для інших помилок - стандартна обробка
+        loop.default_exception_handler(context)
+
+    main_loop.set_exception_handler(asyncio_exception_handler)
+
+    # Ініціалізуємо менеджери сховища та медіа
+    print("=" * 60)
+    sys.stdout.flush()
+    print("🚀 ЗАПУСК ГІБРИДНОГО TELEGRAM БОТА v2.3.0")
+    sys.stdout.flush()
+    print("=" * 60)
+    sys.stdout.flush()
+
+    initialize_managers()
+
+    print("=" * 60)
+    sys.stdout.flush()
+
     # Створюємо Event для зупинки
     stop_event = asyncio.Event()
 
     # Обробник сигналів для коректного завершення
     def signal_handler():
-        logger.info("⏹️ Отримано сигнал зупинки")
+        print("⏹️ Отримано сигнал зупинки")
         stop_event.set()
 
     # Реєструємо обробники сигналів
@@ -2581,7 +3678,8 @@ async def main():
 
     if optimization_enabled:
         try:
-            logger.info("🤖 Ініціалізація системи самооптимізації...")
+            print("🤖 Ініціалізація системи самооптимізації...")
+            sys.stdout.flush()
 
             # Створюємо оптимізатор з AI клієнтами
             optimizer = SelfOptimizer(
@@ -2601,51 +3699,81 @@ async def main():
             # Створюємо менеджер кешу
             cache_manager = CacheManager(default_ttl=300)
 
-            logger.info("✅ Система самооптимізації активована!")
-            logger.info("   📊 Профілювання продуктивності: ✅")
-            logger.info("   ⚙️ Адаптивна оптимізація параметрів: ✅")
-            logger.info("   🤖 AI покращення коду: ✅")
-            logger.info("   💾 Кешування: ✅")
+            print("✅ Система самооптимізації активована!")
+            print("   📊 Профілювання продуктивності: ✅")
+            print("   ⚙️ Адаптивна оптимізація параметрів: ✅")
+            print("   🤖 AI покращення коду: ✅")
+            print("   💾 Кешування: ✅")
+            sys.stdout.flush()
 
         except Exception as e:
+            print(f"⚠️ Помилка ініціалізації оптимізації: {e}")
+            sys.stdout.flush()
             logger.error(f"⚠️ Помилка ініціалізації оптимізації: {e}")
             optimization_enabled = False
 
     # Очищаємо старі локальні файли при старті
-    logger.info("🧹 Перевіряю наявність старих локальних файлів...")
+    print("🧹 Перевіряю наявність старих локальних файлів...")
+    sys.stdout.flush()
     cleanup_old_local_files()
 
     # Налаштування планувальника
     scheduler = setup_scheduler()
 
     logger.info("🚀 Запускаю гібридну систему...")
+    print("🚀 Запускаю гібридну систему...")
+    sys.stdout.flush()
 
     # Запускаємо Client API
     logger.info("📱 Запускаю Telegram Client API...")
+    print("📱 Запускаю Telegram Client API...")
+    sys.stdout.flush()
+
     await client_app.start()
     me = await client_app.get_me()
+
     logger.info(f"✅ Client API запущений для користувача: {me.first_name} (@{me.username})")
+    print(f"✅ Client API запущений для користувача: {me.first_name} (@{me.username})")
+    sys.stdout.flush()
+
+    # Перевіряємо кількість зареєстрованих обробників
+    try:
+        handlers_count = len(client_app.dispatcher.groups)
+        logger.info(f"🔧 Зареєстровано груп обробників: {handlers_count}")
+        for group_id, group_handlers in client_app.dispatcher.groups.items():
+            logger.info(f"   📋 Група {group_id}: {len(group_handlers)} обробників")
+    except Exception as check_err:
+        logger.debug(f"Не вдалося перевірити обробники: {check_err}")
 
     # Запускаємо Bot API
     logger.info("🤖 Запускаю Telegram Bot API...")
+    print("🤖 Запускаю Telegram Bot API...")
+    sys.stdout.flush()
+
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling()
 
     logger.info("🎉 Гібридна система запущена!")
+    print("🎉 Гібридна система запущена!")
+    sys.stdout.flush()
+
     logger.info("📱 Client API зберігає всі повідомлення")
 
-    # Виводимо інформацію в консоль
-    print("\n" + "="*60)
-    print("🤖 БОТ ЗАПУЩЕНО")
-    print("="*60)
-    print(f"📱 Збережені повідомлення: {'✅' if settings['save_saved_messages'] else '❌'}")
-    print(f"💬 Приватні чати: {'✅' if settings['save_private_chats'] else '❌'}")
-    print(f"👥 Групи: {'✅' if settings['save_groups'] else '❌'}")
-    print(f"📢 Канали: {'✅' if settings['save_channels'] else '❌'}")
-    print(f"⏱️  Інтервал перевірки: {settings['check_interval']} сек")
-    print("="*60)
-    print("💾 Збережені повідомлення:\n")
+    # Виводимо інформацію в консоль (logger для Windows сумісності)
+    logger.info("=" * 60)
+    logger.info("БОТ ЗАПУЩЕНО")
+    print("=" * 60)
+    print("БОТ ЗАПУЩЕНО")
+    sys.stdout.flush()
+    logger.info("=" * 60)
+    logger.info(f"📱 Збережені повідомлення: {'✅' if settings['save_saved_messages'] else '❌'}")
+    logger.info(f"💬 Приватні чати: {'✅' if settings['save_private_chats'] else '❌'}")
+    logger.info(f"👥 Групи: {'✅' if settings['save_groups'] else '❌'}")
+    logger.info(f"📢 Канали: {'✅' if settings['save_channels'] else '❌'}")
+    logger.info(f"Інтервал перевірки: {settings['check_interval']} сек")
+    logger.info("=" * 60)
+    logger.info("💾 Збережені повідомлення:")
 
     # Запускаємо швидкий цикл перевірки повідомлень
     message_checker_task = asyncio.create_task(message_checker_loop())
@@ -2686,10 +3814,8 @@ async def main():
         await stop_event.wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n⏹️  Отримано сигнал зупинки...")
-        logger.info("⏹️ Отримано сигнал зупинки через виключення")
     finally:
         print("🔄 Зупиняю систему...")
-        logger.info("🔄 Зупиняю систему...")
 
         # Скасовуємо задачу оптимізації
         if optimization_task and not optimization_task.done():
@@ -2716,10 +3842,8 @@ async def main():
             await asyncio.wait_for(bot_app.stop(), timeout=2.0)
             await asyncio.wait_for(bot_app.shutdown(), timeout=2.0)
             print("✅ Bot API зупинено")
-            logger.info("✅ Bot API зупинено")
         except asyncio.TimeoutError:
             print("✅ Bot API зупинено (з timeout)")
-            logger.info("✅ Bot API зупинено (з timeout)")
         except Exception as e:
             logger.debug(f"Деталі зупинки Bot API: {e}")
 
@@ -2729,13 +3853,13 @@ async def main():
             try:
                 await asyncio.wait_for(client_app.stop(), timeout=3.0)
                 print("✅ Client API зупинено")
-                logger.info("✅ Client API зупинено")
             except (asyncio.TimeoutError, RuntimeError):
                 print("✅ Client API зупинено (з timeout)")
-                logger.info("✅ Client API зупинено (з timeout)")
 
-            # Тепер очищаємо всі незавершені tasks Pyrogram
-            await asyncio.sleep(0.1)  # Даємо час на завершення
+            # Очищаємо незавершені tasks Pyrogram
+            # Pyrogram створює internal tasks (workers + handlers) які потрібно правильно закрити
+            await asyncio.sleep(0.5)  # Даємо достатньо часу на завершення
+
             current_task = asyncio.current_task()
             pending = [
                 task for task in asyncio.all_tasks()
@@ -2743,23 +3867,29 @@ async def main():
             ]
 
             if pending:
-                logger.debug(f"🧹 Очищаю {len(pending)} незавершених Pyrogram tasks...")
+                logger.debug(f"🧹 Очищаю {len(pending)} незавершених tasks...")
+
+                # Скасовуємо всі tasks
                 for task in pending:
-                    task.cancel()
-                # Чекаємо завершення з timeout
-                await asyncio.wait(pending, timeout=1.0)
-                logger.debug("✅ Pyrogram tasks очищено")
+                    if not task.done():
+                        task.cancel()
+
+                # Чекаємо завершення з gather (правильно обробляє CancelledError)
+                await asyncio.gather(*pending, return_exceptions=True)
+
+                # Даємо час на cleanup
+                await asyncio.sleep(0.2)
+
+                logger.debug("✅ Tasks очищено")
 
         except asyncio.CancelledError:
             print("✅ Client API зупинено (cancelled)")
-            logger.info("✅ Client API зупинено (cancelled)")
         except Exception as e:
             logger.debug(f"Деталі зупинки Client API: {e}")
 
         print("\n" + "="*60)
         print("✅ СИСТЕМА ЗУПИНЕНА")
         print("="*60 + "\n")
-        logger.info("✅ Система зупинена")
 
 if __name__ == "__main__":
     try:

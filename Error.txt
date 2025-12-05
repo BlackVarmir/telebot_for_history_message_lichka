@@ -1,0 +1,46 @@
+C:\Users\black\PycharmProjects\telebot_for_history_message_lichka\.venv\Scripts\python.exe C:\Users\black\PycharmProjects\telebot_for_history_message_lichka\hybrid_main.py 
+C:\Users\black\PycharmProjects\telebot_for_history_message_lichka\.venv\Lib\site-packages\paramiko\pkey.py:100: CryptographyDeprecationWarning: TripleDES has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.TripleDES and will be removed from cryptography.hazmat.primitives.ciphers.algorithms in 48.0.0.
+  "cipher": algorithms.TripleDES,
+C:\Users\black\PycharmProjects\telebot_for_history_message_lichka\.venv\Lib\site-packages\paramiko\transport.py:259: CryptographyDeprecationWarning: TripleDES has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.TripleDES and will be removed from cryptography.hazmat.primitives.ciphers.algorithms in 48.0.0.
+  "class": algorithms.TripleDES,
+============================================================
+🚀 ЗАПУСК ГІБРИДНОГО TELEGRAM БОТА v2.3.0
+============================================================
+============================================================
+🤖 Ініціалізація системи самооптимізації...
+✅ Система самооптимізації активована!
+   📊 Профілювання продуктивності: ✅
+   ⚙️ Адаптивна оптимізація параметрів: ✅
+   🤖 AI покращення коду: ✅
+   💾 Кешування: ✅
+🧹 Перевіряю наявність старих локальних файлів...
+💾 .. | 21:32:24 | F
+💾 .. | 21:32:32 | D
+💾 .. | 21:32:31 | F
+💾 .. | 21:32:46 | Т
+💾 .. | 21:32:46 | О
+💾 .. | 21:32:45 | Gggg
+💾 .. | 21:32:50 | И
+💾 .. | 21:32:49 | И
+💾 .. | 21:32:48 | Т
+💾 .. | 21:32:48 | О
+💾 .. | 21:32:47 | О
+💾 .. | 21:32:56 | И
+💾 .. | 21:33:02 | М
+💾 .. | 21:33:01 | П
+💾 .. | 21:33:00 | О
+💾 .. | 21:32:59 | И
+💾 .. | 21:33:04 | М
+💾 .. | 21:33:03 | М
+
+⏹️  Отримано сигнал зупинки...
+🔄 Зупиняю систему...
+✅ Bot API зупинено
+✅ Client API зупинено (з timeout)
+
+============================================================
+✅ СИСТЕМА ЗУПИНЕНА
+============================================================
+
+
+Process finished with exit code 0

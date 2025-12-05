@@ -8,8 +8,14 @@ apscheduler==3.10.4
 # AI dependencies
 openai==1.51.2
 anthropic==0.34.2
+httpx==0.27.2  # Required for openai compatibility
+
+# Storage dependencies
+boto3==1.35.36  # AWS SDK for S3-compatible storage (Hetzner Object Storage)
 
 # Additional dependencies
 asyncio-mqtt==0.16.2
 aiofiles==24.1.0
+psutil==6.1.0  # System monitoring (CPU, RAM)
+python-dotenv==1.0.1  # For .env file support
 

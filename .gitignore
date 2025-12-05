@@ -36,6 +36,10 @@ tmp/
 saved_messages_*.json
 last_message_id.txt
 
+# Media files
+media/
+media/**/*
+
 # Environment variables
 .env
 

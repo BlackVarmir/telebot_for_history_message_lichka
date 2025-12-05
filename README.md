@@ -1,6 +1,6 @@
 # 🤖 Гібридний Telegram Бот з AI Помічником
 
-Бот для автоматичного збереження повідомлень з Telegram з AI аналізом помилок та зручною клавіатурою.
+Бот для автоматичного збереження повідомлень з Telegram з AI аналізом помилок, зручною клавіатурою та підтримкою медіа файлів.
 
 ## ✨ Основні можливості
 
@@ -10,8 +10,25 @@
 - ✅ Групи (опціонально)
 - ✅ Канали (опціонально)
 
+### 📁 Збереження медіа (НОВЕ в 2.3.0)
+- 📷 **Фото** - у найвищій якості
+- 🎥 **Відео** - MP4 файли
+- 📄 **Документи** - PDF, DOCX, ZIP тощо
+- 🎵 **Аудіо** - музика з метаданими
+- 🎤 **Голосові** - голосові повідомлення
+- 🎨 **Стікери** - WEBP файли
+- 🎬 **Анімації** - GIF
+- Організована структура папок
+- Автоматичне завантаження на сервер
+
+### ☁️ Гнучке сховище (НОВЕ в 2.3.0)
+- **Object Storage (S3)** - рекомендовано, швидше та надійніше
+- **SFTP Storage Box** - legacy підтримка
+- Автоматичний вибір на основі конфігурації
+- Всі налаштування в .env файлі
+
 ### 💾 Автоматичний бекап
-- 📤 Щоденне завантаження на Hetzner Storage Box (23:59)
+- 📤 Щоденне завантаження на сховище (23:59)
 - 📝 Автоматична відправка логів (23:58)
 - 🗑️ Очищення старих логів (30 днів)
 - 🧹 Автоматичне очищення старих локальних файлів
@@ -51,24 +68,40 @@ pip install pyrogram python-telegram-bot paramiko apscheduler openai anthropic
 
 ### 2. Налаштування
 
-Відредагуйте `hybrid_main.py`:
+Створіть файл `.env` на основі `.env.example`:
 
-```python
-# Telegram Client API
-API_ID = "ваш_api_id"
-API_HASH = "ваш_api_hash"
+```bash
+cp .env.example .env
+```
 
-# Bot API
-BOT_TOKEN = "ваш_bot_token"
+Відредагуйте `.env`:
 
-# Storage Box
-STORAGE_BOX_HOST = "ваш_хост"
-STORAGE_BOX_USERNAME = "ваш_username"
-STORAGE_BOX_PASSWORD = "ваш_пароль"
+```env
+# Telegram API
+API_ID=your_api_id
+API_HASH=your_api_hash
+BOT_TOKEN=your_bot_token
+
+# Storage (виберіть один варіант)
+# Варіант 1: Object Storage (S3) - РЕКОМЕНДОВАНО
+STORAGE_TYPE=s3
+S3_ENDPOINT_URL=https://fsn1.your-objectstorage.com
+S3_ACCESS_KEY=your_access_key
+S3_SECRET_KEY=your_secret_key
+S3_BUCKET_NAME=telegram-bot-backup
+S3_REGION=fsn1
+
+# Варіант 2: SFTP Storage Box - LEGACY
+# STORAGE_TYPE=sftp
+# STORAGE_BOX_HOST=your_host.your-storagebox.de
+# STORAGE_BOX_USERNAME=your_username
+# STORAGE_BOX_PASSWORD=your_password
+# STORAGE_BOX_PATH=/backup/telegram_bot/
 
 # AI (опціонально)
-OPENAI_API_KEY = "ваш_openai_key"  # або
-ANTHROPIC_API_KEY = "ваш_anthropic_key"
+OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
+AI_PROVIDER=openai
 ```
 
 ### 3. Запуск
@@ -87,9 +120,20 @@ python hybrid_main.py
 
 ## 📚 Документація
 
+### Основна документація
 - **[AI_SETUP.md](AI_SETUP.md)** - Налаштування AI помічника
 - **[KEYBOARD_GUIDE.md](KEYBOARD_GUIDE.md)** - Керування через клавіатуру
-- **[WHATS_NEW.md](WHATS_NEW.md)** - Що нового в версії 2.0
+- **[WHATS_NEW.md](WHATS_NEW.md)** - Що нового
+- **[CHANGELOG.md](CHANGELOG.md)** - Історія змін
+
+### Нові можливості v2.3.0
+- **[MIGRATION_S3.md](MIGRATION_S3.md)** - Міграція на Object Storage (S3)
+- **[MEDIA_INTEGRATION.md](MEDIA_INTEGRATION.md)** - Інтеграція збереження медіа
+
+### Інші гайди
+- **[MESSAGES_VIEWER_GUIDE.md](MESSAGES_VIEWER_GUIDE.md)** - Перегляд повідомлень
+- **[CLEANUP_GUIDE.md](CLEANUP_GUIDE.md)** - Очищення файлів
+- **[SCANNING_GUIDE.md](SCANNING_GUIDE.md)** - Сканування повідомлень
 
 ---
 
@@ -255,17 +299,25 @@ export ANTHROPIC_API_KEY="sk-ant-your-key"
 
 ---
 
-## 🎉 Що нового в 2.1?
+## 🎉 Що нового в 2.3.0?
 
-- 🤖 AI Помічник для аналізу помилок
-- ⌨️ Telegram клавіатура
-- 📝 Покращена система логування
-- 🔔 Автоматичні сповіщення про помилки
-- 📊 Моніторинг помилок
-- 📖 Перегляд повідомлень з пагінацією
-- 🗑️ Автоматичне очищення старих локальних файлів
+### 📁 Збереження медіа файлів
+- Автоматичне збереження фото, відео, документів
+- Голосові повідомлення, аудіо, стікери, GIF
+- Організована структура папок
+- Метадані для кожного медіа файлу
 
-Детальніше в [WHATS_NEW.md](WHATS_NEW.md) та [CLEANUP_GUIDE.md](CLEANUP_GUIDE.md)
+### ☁️ Object Storage (S3)
+- Підтримка Hetzner Object Storage
+- Швидше та надійніше ніж SFTP
+- Автоматичне створення buckets
+- Сумісність з AWS S3
+
+### 📋 Нові команди
+- `/commands` - список всіх команд
+- `/mediastats` - статистика медіа файлів
+
+Детальніше в [WHATS_NEW.md](WHATS_NEW.md) та [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
@@ -294,6 +346,6 @@ MIT License - використовуйте вільно
 
 Насолоджуйтесь використанням бота! 🎉
 
-**Версія:** 2.1.2
-**Дата:** 2025-10-13
+**Версія:** 2.3.0
+**Дата:** 2025-10-21
 
