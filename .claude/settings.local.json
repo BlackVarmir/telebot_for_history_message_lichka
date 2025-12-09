@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(python:*)",
+      "Bash(findstr:*)",
+      "Bash(if exist run_bot.bat del run_bot.bat)",
+      "Bash(timeout 60 python:*)",
+      "Bash(timeout 5 python:*)",
+      "Bash(timeout 3 echo:*)",
+      "Bash(timeout 3 python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
